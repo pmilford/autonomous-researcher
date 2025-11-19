@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from typing import Optional, List
 
 from google import genai
@@ -8,6 +9,7 @@ from google.genai import types
 from logger import print_panel, print_status, log_step, logger
 
 import modal
+from modal.stream_type import StreamType
 
 # Cache a single sandbox per run so the agent can keep state across tool calls.
 _shared_sandbox: Optional[modal.Sandbox] = None
@@ -105,9 +107,12 @@ def execute_in_sandbox(code: str):
     """
     Executes Python code inside a persistent Modal Sandbox using sandbox.exec.
 
-    This function is exposed to Gemini as a tool. The agent will decide when to
-    call it, and we run it manually in the loop so that we can show the
-    model's thoughts before the code executes.
+    Behavior:
+    - Starts a long-lived `python -u -` process in the sandbox.
+    - Streams both STDOUT and STDERR to your local CLI *as they are produced*,
+      similar to running a long training job in Colab.
+    - Captures full STDOUT/STDERR buffers and returns them as a string so the
+      agent can inspect logs after the run finishes.
     """
     try:
         sandbox = _get_shared_sandbox(_selected_gpu)
@@ -115,31 +120,64 @@ def execute_in_sandbox(code: str):
         log_step("EXECUTION", "Launching python exec inside Sandbox...")
         print_panel(code, "Sandbox Code", "code")
 
-        # Run the snippet via exec; stdout/stderr are streamed text.
-        proc = sandbox.exec("python", "-u", "-")
+        # Use PIPE on both streams so we can capture and stream them ourselves.
+        proc = sandbox.exec(
+            "python",
+            "-u",
+            "-",
+            stdout=StreamType.PIPE,
+            stderr=StreamType.PIPE,
+        )
 
+        # Send the code into the sandboxed Python process.
         proc.stdin.write(code.encode("utf-8"))
         proc.stdin.write_eof()
         proc.stdin.drain()  # Flush buffered stdin
 
-        stdout: List[str] = []
-        stderr: List[str] = []
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
 
-        log_step("EXECUTION", "Reading stdout/stderr streams...")
-        for part in proc.stdout:
-            stdout.append(part)
-            print(part, end="")
+        log_step("EXECUTION", "Streaming stdout/stderr from Sandbox...")
 
-        for part in proc.stderr:
-            stderr.append(part)
-            print(part, end="", file=sys.stderr)
+        def _drain_stream(reader, buffer: List[str], is_stderr: bool):
+            """Continuously read from a StreamReader and mirror to local stdout/stderr."""
+            try:
+                for chunk in reader:
+                    # Modal returns text lines (with trailing newline preserved).
+                    buffer.append(chunk)
+                    if is_stderr:
+                        print(chunk, end="", file=sys.stderr, flush=True)
+                    else:
+                        print(chunk, end="", flush=True)
+            except Exception as e:
+                # Don't crash the whole tool if streaming fails; just log.
+                stream_name = "stderr" if is_stderr else "stdout"
+                log_step("WARNING", f"Error while streaming {stream_name}: {e}")
 
+        # Read stdout and stderr concurrently so training logs / progress bars
+        # appear in real time regardless of which stream they use.
+        stdout_thread = threading.Thread(
+            target=_drain_stream, args=(proc.stdout, stdout_chunks, False), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_stream, args=(proc.stderr, stderr_chunks, True), daemon=True
+        )
+
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to finish.
         log_step("EXECUTION", "Waiting for process exit...")
         exit_code = proc.wait()
+
+        # Make sure we've drained any remaining output.
+        stdout_thread.join(timeout=5.0)
+        stderr_thread.join(timeout=5.0)
+
         log_step("EXECUTION", f"Process exited with code {exit_code}")
 
-        stdout_str = "".join(stdout)
-        stderr_str = "".join(stderr)
+        stdout_str = "".join(stdout_chunks)
+        stderr_str = "".join(stderr_chunks)
 
         return f"Exit Code: {exit_code}\nSTDOUT:\n{stdout_str}\nSTDERR:\n{stderr_str}"
 
