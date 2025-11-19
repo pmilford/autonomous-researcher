@@ -2,6 +2,7 @@ import sys
 import argparse
 from dotenv import load_dotenv
 
+from agent import run_experiment_loop
 from logger import print_status
 
 
@@ -10,10 +11,10 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="AI Research Agent CLI (single-agent and orchestrator modes)"
+        description="AI Experiment Agent CLI (single-agent and orchestrator modes)"
     )
     parser.add_argument(
-        "hypothesis",
+        "task",
         type=str,
         help=(
             "In 'single' mode: the hypothesis to verify.\n"
@@ -24,66 +25,75 @@ def main():
         "--gpu",
         type=str,
         default=None,
-        help="GPU type to request for the sandbox (e.g., 'T4', 'A10G', 'A100', 'any').",
+        help="GPU type to request (e.g., 'T4', 'A10G', 'A100', 'any').",
     )
     parser.add_argument(
         "--mode",
+        type=str,
         choices=["single", "orchestrator"],
         default="single",
         help=(
-            "Execution mode: 'single' runs a single research agent (original behavior); "
-            "'orchestrator' runs the higher-level multi-agent research orchestrator."
+            "Execution mode: "
+            "'single' runs a single-researcher agent (original behavior); "
+            "'orchestrator' runs the higher-level multi-agent orchestrator."
         ),
     )
     parser.add_argument(
         "--num-agents",
         type=int,
-        default=10,
-        help=(
-            "Maximum conceptual number of single-researcher agents to coordinate "
-            "(orchestrator mode only)."
-        ),
+        default=3,
+        help="(orchestrator) Number of initial single-researcher agents to launch.",
     )
     parser.add_argument(
-        "--max-steps",
+        "--max-rounds",
         type=int,
-        default=10,
+        default=3,
+        help="(orchestrator) Maximum number of orchestration rounds.",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=2,
         help=(
-            "Maximum number of reasoning/tool steps for the orchestrator before "
-            "generating the final paper."
+            "(orchestrator) Maximum number of experiments to run in parallel "
+            "in a single wave of tool calls."
         ),
     )
 
     args = parser.parse_args()
 
+    # Preserve existing behavior by default: single agent mode.
     if args.mode == "single":
         print_status("Initializing Single Researcher Agent...", "bold cyan")
-        try:
-            import agent as agent_module
-            from agent import run_experiment_loop
 
+        try:
             # Record GPU preference globally for sandbox creation
+            import agent as agent_module
+
             agent_module._selected_gpu = args.gpu
-            run_experiment_loop(args.hypothesis)
+            run_experiment_loop(args.task)
         except KeyboardInterrupt:
             print_status("\nExperiment interrupted by user.", "bold red")
             sys.exit(0)
         except Exception as e:
-            print_status(f"\nFatal Error (single-agent mode): {e}", "bold red")
+            print_status(f"\nFatal Error: {e}", "bold red")
             sys.exit(1)
     else:
+        # Multi-agent orchestrator mode.
         print_status("Initializing Orchestrator Agent...", "bold cyan")
+
         try:
             from orchestrator import run_orchestrator_loop
 
             run_orchestrator_loop(
-                research_task=args.hypothesis,
-                num_agents=args.num_agents,
-                gpu=args.gpu,
-                max_steps=args.max_steps,
+                research_task=args.task,
+                num_initial_agents=args.num_agents,
+                max_rounds=args.max_rounds,
+                default_gpu=args.gpu,
+                max_parallel_experiments=args.max_parallel,
             )
         except KeyboardInterrupt:
-            print_status("\nOrchestrator run interrupted by user.", "bold red")
+            print_status("\nOrchestrated experiment interrupted by user.", "bold red")
             sys.exit(0)
         except Exception as e:
             print_status(f"\nFatal Error (orchestrator mode): {e}", "bold red")

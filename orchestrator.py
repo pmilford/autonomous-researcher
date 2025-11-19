@@ -1,169 +1,356 @@
 import os
+import sys
 import json
-from typing import Optional, List, Dict, Any
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Dict, Any
 
 from google import genai
 from google.genai import types
 
-import agent as agent_module
-from agent import _build_generation_config
+from logger import print_panel, print_status, log_step, logger
 
-from logger import print_panel as base_print_panel, print_status, log_step, logger
 
-# Global state for orchestrator
-_selected_gpu_for_subagents: Optional[str] = None
+# Global orchestrator state
+_default_gpu: Optional[str] = None
 _experiment_counter: int = 0
 
 
+def _build_orchestrator_generation_config(
+    *,
+    tools: Optional[List] = None,
+    system_instruction: Optional[str] = None,
+    disable_autofc: bool = False,
+) -> types.GenerateContentConfig:
+    """
+    Build a GenerateContentConfig for the orchestrator agent.
+
+    - Enables Gemini "thinking mode" with visible thought summaries.
+    - Sets thinking_level=HIGH.
+    - Optionally disables automatic function calling so we can manually run tools
+      and show thoughts before actions.
+    """
+    thinking_config = types.ThinkingConfig(
+        thinking_level=types.ThinkingLevel.HIGH,
+        include_thoughts=True,
+    )
+
+    config_kwargs: Dict[str, Any] = {
+        "tools": tools,
+        "system_instruction": system_instruction,
+        "thinking_config": thinking_config,
+    }
+
+    if disable_autofc:
+        config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+            disable=True
+        )
+
+    return types.GenerateContentConfig(**config_kwargs)
+
+
 def _build_orchestrator_system_prompt(
-    num_agents_hint: int, gpu_hint: str
+    num_initial_agents: int,
+    max_rounds: int,
+    default_gpu_hint: Optional[str],
+    max_parallel_experiments: int,
 ) -> str:
-    """System-level instructions for the orchestrator agent."""
-    return f"""You are a principal investigator orchestrating up to {num_agents_hint} autonomous research agents.
+    """
+    System-level instructions for the orchestrator (principal investigator).
+    """
+    compute_hint = default_gpu_hint or "CPU-only (no explicit GPU request)"
+    return f"""You are a principal investigator orchestrating a team of autonomous research scientists.
+Your goal is to answer a high-level research question as rigorously as possible.
 
-Your goal is to design and manage an end-to-end research program that answers the user's research_task using empirical
-experiments carried out by specialized research agents.
+You have access to this tool:
 
-Tool:
-- run_single_researcher_agent(hypothesis: str) -> RunResult
-  - Runs a full experiment cycle inside a dedicated research agent that executes Python in a Modal sandbox
-    with GPU hint: {gpu_hint}.
-  - The agent will design and run experiments, then return a concise natural-language report.
-  - The RunResult object has:
-      - experiment_id: str
-      - hypothesis: str
-      - report: str
+- run_researcher(hypothesis: str, gpu: Optional[str] = None):
+  Launches an independent single-researcher agent (in its own process) that will:
+    - interpret the hypothesis
+    - plan experiments
+    - run Python code in a Modal sandbox
+    - iteratively refine its experiments
+    - produce a final report explaining how it tested the hypothesis and what it found
 
-Working style:
-1. Begin by restating the research_task, listing key sub-questions and candidate hypotheses.
-2. Batch experiments: propose a small set of clear, focused hypotheses and call run_single_researcher_agent
-   once for each hypothesis you want tested.
-3. After each batch, carefully read and synthesize the returned reports. Decide what you've learned and
-   what remains uncertain.
-4. If more evidence is needed, design sharper follow-up hypotheses and call the tool again.
-5. When you are satisfied that the evidence is sufficient, stop calling tools and focus on writing a complete
-   arXiv-style paper that answers the research_task.
+  The tool returns a JSON object with:
+    - experiment_id: integer identifier
+    - hypothesis: the original hypothesis string
+    - gpu: the GPU string that was requested (or null/None for CPU-only)
+    - exit_code: integer process exit code
+    - transcript: the full textual transcript of the agent's run, including:
+        - its visible "thinking" summaries
+        - tool calls and logs
+        - the final report it prints at the end
 
-ArXiv-style paper requirements:
-- Use markdown with LaTeX-style math where helpful.
-- Include, in order:
-  - Title
-  - Authors (you may use placeholder names or "AI Researcher")
-  - Abstract
-  - 1. Introduction
-  - 2. Related Work (high-level, based only on general knowledge you already have)
-  - 3. Method
-  - 4. Experiments
-  - 5. Results
-  - 6. Discussion
-  - 7. Conclusion
-  - 8. Limitations & Future Work
-- Heavily reference the concrete experiments and findings produced by your research agents.
+GPU / compute selection:
+
+- The `gpu` argument is optional.
+- If you provide it, it should usually be one of: "T4", "A10G", "A100", or "any".
+- If you omit it, the host uses its default compute setting for experiments:
+  {compute_hint}
+
+Use stronger GPUs (e.g., "A100") only when you are conceptually simulating
+experiments that would truly require more compute (e.g., large models, longer runs).
+Use "T4" or "any" for lighter experiments, or omit the argument to stick to the default.
+
+Parallelism:
+
+- The host can run up to {max_parallel_experiments} experiments in parallel in a single wave.
+- If you propose multiple run_researcher calls in one step, they will be launched concurrently.
+
+Workflow:
+
+1. **Decomposition**
+   Break the research task into concrete, testable hypotheses.
+   Start with about {num_initial_agents} distinct hypotheses that, together,
+   would substantially answer the research task.
+
+2. **Delegation**
+   For each hypothesis that needs empirical validation, call `run_researcher`.
+   Use the tool sparingly and purposefully—each call is expensive.
+
+3. **Synthesis & Follow-ups**
+   Carefully read the transcripts that come back.
+   Extract:
+   - what was tested and how
+   - key numerical or qualitative results
+   - limitations, confounders, and failure cases
+
+   Decide whether additional experiments are needed:
+   - follow-ups to clarify ambiguous results
+   - ablations or robustness checks
+   - sanity checks when results look surprising
+
+   Avoid more than {max_rounds} waves of experiments unless strictly necessary.
+   Prefer a small number of high-quality, well-motivated experiments
+   over many redundant or noisy runs.
+
+4. **Final Paper**
+   When you are satisfied that the evidence is sufficient, synthesize everything
+   into an Arxiv-style paper with the following structure:
+
+   - Title
+   - Authors (use "AI Researcher" as a placeholder author list)
+   - Abstract
+   - 1. Introduction
+   - 2. Method
+   - 3. Experiments
+   - 4. Results
+   - 5. Discussion & Limitations
+   - 6. Related Work (high level; no formal citations or references required)
+   - 7. Conclusion
+
+   Make the paper:
+   - technically precise and information-dense
+   - explicit about experimental design and assumptions
+   - honest about limitations and potential failure modes
 
 Important:
-- Be explicit about each experiment you request: why you're running it and what evidence you expect.
-- Think step-by-step; your thoughts will be shown to the user.
-- Do not fabricate tool results; only rely on what run_single_researcher_agent actually returns.
-- When you have finished writing the paper, end your final message with a line that contains only: [DONE].
+
+- **Think step-by-step and narrate your reasoning.**
+  Your thought summaries will be shown in the CLI under "Orchestrator Thinking".
+- **Be explicit about decisions.**
+  Explain why you are launching new agents or why you believe experiments are sufficient.
+- **Use the tool when it matters.**
+  Do not call the tool for trivial reformulations or questions that can be answered
+  by pure reasoning.
+
+Termination:
+
+- When your final Arxiv-style paper is complete, end your response with a line
+  that contains only:
+  [DONE]
 """
 
 
-def run_single_researcher_agent(hypothesis: str) -> Dict[str, str]:
+def run_researcher(hypothesis: str, gpu: Optional[str] = None) -> Dict[str, Any]:
     """
-    Tool wrapper that runs a full single-researcher agent experiment and
-    captures its final report without modifying the agent implementation.
+    Tool wrapper that launches a single-researcher agent experiment in a separate process.
+
+    This function:
+    - Spawns: `python main.py "<hypothesis>" --mode single [--gpu GPU]`
+    - Streams all logs from the underlying agent back to the user's terminal
+      in real time (so all thinking/tool calls are visible).
+    - Captures the full transcript (stdout + stderr) so the orchestrator
+      can feed it back into Gemini.
+
+    Args:
+        hypothesis: The experimental hypothesis to pass to the single agent.
+        gpu: Optional GPU string ("T4", "A10G", "A100", "any", etc.).
+             If None, uses the orchestrator's default GPU (which may be CPU-only).
+
+    Returns:
+        A JSON-serializable dict:
+            {
+                "experiment_id": int,
+                "hypothesis": str,
+                "gpu": Optional[str],
+                "exit_code": int,
+                "transcript": str,
+            }
     """
-    global _experiment_counter
+    global _experiment_counter, _default_gpu
+
     _experiment_counter += 1
     experiment_id = _experiment_counter
 
-    log_step("ORCH_TOOL", f"[experiment {experiment_id}] Starting single-researcher agent")
-    print_status(
-        f"[Orchestrator] Launching experiment {experiment_id} for hypothesis:",
-        "bold cyan",
+    assigned_gpu = gpu or _default_gpu
+
+    header_lines = [
+        f"Experiment {experiment_id}",
+        f"GPU: {assigned_gpu or 'CPU-only / default'}",
+        "Hypothesis:",
+        hypothesis,
+    ]
+    print_panel(
+        "\n".join(header_lines),
+        f"Experiment {experiment_id}: Scheduled",
+        "bold blue",
     )
-    base_print_panel(hypothesis, f"Experiment {experiment_id}: Hypothesis", "code")
+    log_step(
+        "ORCH_EXPERIMENT",
+        f"Scheduled experiment {experiment_id} with GPU={assigned_gpu or 'None'}",
+    )
 
-    # Configure the agent's GPU preference for this run.
-    agent_module._selected_gpu = _selected_gpu_for_subagents
+    # Build the command for the single-agent process.
+    main_path = os.path.join(os.path.dirname(__file__), "main.py")
+    cmd: List[str] = [
+        sys.executable,
+        main_path,
+        hypothesis,
+        "--mode",
+        "single",
+    ]
+    if assigned_gpu:
+        cmd.extend(["--gpu", assigned_gpu])
 
-    # Monkey-patch agent.print_panel to capture the "Final Report" panel.
-    original_print_panel = agent_module.print_panel
-    captured: Dict[str, Any] = {"report": None}
+    print_status(
+        f"[Experiment {experiment_id}] Spawning single-agent process with command: "
+        f"{' '.join(cmd)}",
+        "dim",
+    )
 
-    def wrapped_print_panel(*args, **kwargs):
-        # Expected signature: (text, title, style), but we accept any form.
-        title = None
-        if "title" in kwargs:
-            title = kwargs["title"]
-        elif len(args) >= 2:
-            title = args[1]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
 
-        if title == "Final Report" and len(args) >= 1:
-            captured["report"] = str(args[0])
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
 
-        # Forward to original for normal CLI rendering.
-        return original_print_panel(*args, **kwargs)
+    def _reader(stream, chunks: List[str], is_err: bool) -> None:
+        """Read from a subprocess stream, streaming to CLI and capturing for transcript."""
+        for line in stream:
+            chunks.append(line)
+            target = sys.stderr if is_err else sys.stdout
+            target.write(line)
+            target.flush()
 
-    agent_module.print_panel = wrapped_print_panel
+    # Stream stdout and stderr concurrently.
+    t_out = threading.Thread(
+        target=_reader, args=(proc.stdout, stdout_chunks, False), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_reader, args=(proc.stderr, stderr_chunks, True), daemon=True
+    )
 
-    try:
-        agent_module.run_experiment_loop(hypothesis)
-    except Exception as e:
-        log_step("ORCH_TOOL_ERROR", f"[experiment {experiment_id}] {e}")
-        print_status(
-            f"[Orchestrator] Experiment {experiment_id} failed: {e}",
-            "bold red",
+    t_out.start()
+    t_err.start()
+
+    exit_code = proc.wait()
+    t_out.join()
+    t_err.join()
+
+    print_status(
+        f"[Experiment {experiment_id}] Completed with exit code {exit_code}",
+        "bold blue",
+    )
+
+    transcript = (
+        f"=== Experiment {experiment_id} Transcript ===\n"
+        f"GPU: {assigned_gpu or 'CPU-only / default'}\n"
+        f"Hypothesis: {hypothesis}\n"
+        f"Exit code: {exit_code}\n"
+        f"\n--- STDOUT ---\n"
+        + "".join(stdout_chunks)
+        + "\n--- STDERR ---\n"
+        + "".join(stderr_chunks)
+    )
+
+    # Guard against enormous transcripts.
+    max_len = 120_000
+    if len(transcript) > max_len:
+        transcript = (
+            transcript[:max_len]
+            + "\n...[TRANSCRIPT TRUNCATED BY ORCHESTRATOR FOR CONTEXT SIZE]...\n"
         )
-        report_text = f"Experiment {experiment_id} failed with error: {e!r}"
-    else:
-        report_text = captured["report"] or (
-            "No explicit final report panel was captured from the agent. "
-            "Rely on the printed experiment trace for details."
-        )
-    finally:
-        # Always restore the original function to avoid side effects.
-        agent_module.print_panel = original_print_panel
 
-    log_step("ORCH_TOOL", f"[experiment {experiment_id}] Finished single-researcher agent")
-    base_print_panel(report_text, f"Experiment {experiment_id}: Agent Report", "result")
-
-    return {
-        "experiment_id": str(experiment_id),
+    result: Dict[str, Any] = {
+        "experiment_id": experiment_id,
         "hypothesis": hypothesis,
-        "report": report_text,
+        "gpu": assigned_gpu,
+        "exit_code": exit_code,
+        "transcript": transcript,
     }
+
+    return result
 
 
 def run_orchestrator_loop(
     research_task: str,
-    num_agents: int = 3,
-    gpu: Optional[str] = None,
-    max_steps: int = 10,
-):
+    num_initial_agents: int = 3,
+    max_rounds: int = 3,
+    default_gpu: Optional[str] = None,
+    max_parallel_experiments: int = 2,
+) -> None:
     """
-    Top-level orchestrator loop that uses Gemini 3 Pro to coordinate
-    multiple single-researcher agents and produce an arXiv-style paper.
+    Main orchestrator loop using Gemini 3 Pro with thinking + manual tool calling.
+
+    Args:
+        research_task: High-level research question or task to investigate.
+        num_initial_agents: How many distinct hypotheses to target in the first wave.
+        max_rounds: Soft cap on how many orchestration steps/waves to perform.
+        default_gpu: Default GPU string for experiments (or None for CPU-only).
+        max_parallel_experiments: Maximum number of experiments to run in parallel
+                                  in a single wave of tool calls.
     """
-    global _selected_gpu_for_subagents
-    _selected_gpu_for_subagents = gpu
+    global _default_gpu
+    _default_gpu = default_gpu
 
-    gpu_hint = gpu or "CPU"
-
-    base_print_panel(
-        f"Research task: {research_task}",
-        "Orchestrator: Starting Program",
+    print_panel(
+        f"Research Task:\n{research_task}",
+        "Orchestrator: Starting Research Project",
         "bold magenta",
     )
-    print_status("Orchestrator using Gemini model: gemini-3-pro-preview", "info")
-    print_status(f"Conceptual team size (n agents): {num_agents}", "info")
-    print_status(f"Sandbox GPU request for experiments: {gpu_hint}", "info")
-    log_step("ORCH_START", f"Task: {research_task}")
+    log_step("ORCH_START", f"Research Task: {research_task}")
+    print_status(
+        f"Orchestrator configuration: {num_initial_agents} initial agents, "
+        f"up to {max_rounds} rounds.",
+        "info",
+    )
+    print_status(
+        f"Default GPU for experiments: {default_gpu or 'CPU-only / none'}",
+        "info",
+    )
+    print_status(
+        f"Maximum parallel experiments per wave: {max_parallel_experiments}",
+        "info",
+    )
+    print_status("Gemini thinking: HIGH (thought summaries visible)", "info")
 
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
-    tools = [run_single_researcher_agent]
-    system_prompt = _build_orchestrator_system_prompt(num_agents, gpu_hint)
+    tools = [run_researcher]
+    system_prompt = _build_orchestrator_system_prompt(
+        num_initial_agents=num_initial_agents,
+        max_rounds=max_rounds,
+        default_gpu_hint=default_gpu,
+        max_parallel_experiments=max_parallel_experiments,
+    )
 
     # Initial conversation: just the research task as a user message.
     history: List[types.Content] = [
@@ -172,161 +359,227 @@ def run_orchestrator_loop(
             parts=[
                 types.Part.from_text(
                     text=(
-                        f"Research_task: {research_task}\n\n"
-                        f"You control up to {num_agents} single-researcher agents. "
-                        f"Use run_single_researcher_agent whenever you need new experimental evidence."
+                        "High-level research task:\n"
+                        f"{research_task}\n\n"
+                        "Begin by decomposing this into concrete hypotheses and planning "
+                        "which ones require empirical validation. When appropriate, "
+                        "call run_researcher for hypotheses that need experiments."
                     )
                 )
             ],
         )
     ]
 
+    # Track experiments for a compact summary view in the CLI.
+    all_experiments: List[Dict[str, Any]] = []
+
+    max_steps = max(8, max_rounds * 3)
+
     for step in range(1, max_steps + 1):
-        print_status(f"[Orchestrator] Step {step}...", "dim")
+        print_status(f"Orchestrator step {step}...", "dim")
 
         try:
             response = client.models.generate_content(
                 model="gemini-3-pro-preview",
                 contents=history,
-                config=_build_generation_config(
+                config=_build_orchestrator_generation_config(
                     tools=tools,
                     system_instruction=system_prompt,
-                    disable_autofc=True,  # manual tool loop
+                    disable_autofc=True,
                 ),
             )
         except Exception as e:
-            print_status(f"[Orchestrator] API Error: {e}", "error")
-            logger.error(f"[Orchestrator] API Error: {e}")
+            print_status(f"Orchestrator API Error: {e}", "error")
+            logger.error(f"Orchestrator API Error: {e}")
             break
 
         if not response.candidates:
-            print_status("[Orchestrator] Empty response from model.", "warning")
+            print_status("Orchestrator: empty response from model.", "warning")
             break
 
         candidate = response.candidates[0]
         model_content = candidate.content
 
         if not model_content or not model_content.parts:
-            print_status("[Orchestrator] Empty content from model.", "warning")
+            print_status("Orchestrator: empty content from model.", "warning")
             break
 
-        # Append the raw assistant message (including thought + function parts).
+        # Append full model message (including thoughts & function calls) to preserve state.
         history.append(model_content)
 
         thoughts: List[str] = []
         messages: List[str] = []
-        function_calls = []
+        function_calls: List[Any] = []
 
         for part in model_content.parts:
+            # Thought summaries from thinking mode.
             if getattr(part, "thought", False) and part.text:
                 thoughts.append(part.text)
+
+            # Function/tool call parts.
             if part.function_call:
                 function_calls.append(part.function_call)
+
+            # Regular assistant text (exclude thought parts so we don't double-print).
             if part.text and not getattr(part, "thought", False):
                 messages.append(part.text)
 
+        # 1. Show reasoning before any action.
         if thoughts:
             joined_thoughts = "\n\n".join(thoughts)
-            base_print_panel(joined_thoughts, "Orchestrator Thinking", "thought")
+            print_panel(joined_thoughts, "Orchestrator Thinking", "thought")
             log_step("ORCH_THOUGHT", joined_thoughts)
 
+        # 2. Show natural-language messages (plans, explanations, etc.).
         if messages:
             joined_messages = "\n\n".join(messages)
-            base_print_panel(joined_messages, "Orchestrator Message", "info")
+            print_panel(joined_messages, "Orchestrator Message", "info")
             log_step("ORCH_MODEL", joined_messages)
 
         combined_text = "\n".join(thoughts + messages)
         if "[DONE]" in combined_text:
-            print_status("[Orchestrator] Model signaled completion.", "success")
-            break
+            # Orchestrator already produced the final paper and signaled completion.
+            print_status("Orchestrator signaled completion.", "success")
+            return
 
+        # If the model didn't call any tools this turn, assume we're done.
         if not function_calls:
             print_status(
-                "[Orchestrator] No tool calls this step; assuming it moved toward writing the paper.",
+                "Orchestrator: no tool calls in this step; assuming research is complete.",
                 "info",
             )
-            # Let the orchestrator continue thinking or move directly to the final paper
-            # in subsequent steps.
-            continue
+            break
 
-        # Execute any requested tools.
-        for fn_call in function_calls:
+        # 3. Execute requested tools (run_researcher) in parallel where possible.
+        results_for_history: List[Dict[str, Any]] = []
+
+        def _execute_single_call(fn_call) -> Dict[str, Any]:
             fn_name = fn_call.name
             fn_args = dict(fn_call.args or {})
 
-            pretty_args = json.dumps(fn_args, indent=2)
-            base_print_panel(
-                f"{fn_name}({pretty_args})",
+            print_panel(
+                f"{fn_name}({json.dumps(fn_args, indent=2)})",
                 "Orchestrator Tool Call",
                 "code",
             )
-            log_step("ORCH_TOOL_CALL", f"{fn_name}({pretty_args})")
+            log_step("ORCH_TOOL_CALL", f"{fn_name}({fn_args})")
 
-            if fn_name == "run_single_researcher_agent":
-                result = run_single_researcher_agent(**fn_args)
+            if fn_name == "run_researcher":
+                return run_researcher(**fn_args)
             else:
-                result = {
+                return {
                     "error": (
                         f"Unsupported tool '{fn_name}'. "
-                        "Only 'run_single_researcher_agent' is available at the orchestrator level."
+                        "Only 'run_researcher' is available."
                     )
                 }
 
-            # Truncate very long JSON payloads to keep console readable.
-            result_str = json.dumps(result, indent=2)
-            if len(result_str) > 20000:
-                result_str = (
-                    result_str[:10000] + "\n...[TRUNCATED]...\n" + result_str[-10000:]
+        max_workers = max(1, min(max_parallel_experiments, len(function_calls)))
+        print_status(
+            f"Launching {len(function_calls)} experiment(s) "
+            f"with up to {max_workers} in parallel...",
+            "info",
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_execute_single_call, fc) for fc in function_calls]
+
+            # Wait for all to complete; display each result as it finishes.
+            for future in futures:
+                result = future.result()
+
+                # Prepare a human-readable, truncated view for the CLI.
+                display_result = result
+                if isinstance(result, dict):
+                    display_result = dict(result)  # shallow copy
+                    transcript = display_result.get("transcript", "")
+                    if isinstance(transcript, str) and len(transcript) > 4000:
+                        display_result["transcript"] = (
+                            transcript[:4000]
+                            + "\n...[TRANSCRIPT TRUNCATED IN VIEW; "
+                            "FULL TEXT PASSED BACK TO MODEL]..."
+                        )
+
+                print_panel(
+                    json.dumps(display_result, indent=2, ensure_ascii=False),
+                    "Orchestrator Tool Result",
+                    "result",
                 )
+                log_step("ORCH_TOOL_RESULT", "run_researcher completed")
 
-            base_print_panel(result_str, "Orchestrator Tool Result", "result")
-            log_step("ORCH_TOOL_RESULT", "Executed")
+                results_for_history.append(result)
 
-            # Feed tool response back to the model.
+                if isinstance(result, dict) and "experiment_id" in result:
+                    all_experiments.append(result)
+
+        # Feed each tool response back as a TOOL message with a functionResponse part.
+        for result in results_for_history:
             history.append(
                 types.Content(
                     role="tool",
                     parts=[
                         types.Part.from_function_response(
-                            name=fn_name,
+                            name="run_researcher",
                             response={"result": result},
                         )
                     ],
                 )
             )
 
-    # Final paper generation.
-    try:
-        print_status(
-            "[Orchestrator] Generating final arXiv-style paper...",
-            "bold green",
-        )
-        history.append(
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(
-                        text=(
-                            "Based on all previous discussion and tool results, "
-                            "write the full arXiv-style research paper now. "
-                            "Remember to end your response with a line that contains only [DONE]."
-                        )
-                    )
-                ],
-            )
-        )
+        # Show a compact summary of all experiments so far to keep the CLI readable.
+        if all_experiments:
+            summary_lines: List[str] = []
+            for exp in all_experiments:
+                hyp_snippet = (exp.get("hypothesis", "") or "").replace("\n", " ")
+                if len(hyp_snippet) > 80:
+                    hyp_snippet = hyp_snippet[:77] + "..."
+                summary_lines.append(
+                    f"Exp {exp.get('experiment_id')} | "
+                    f"GPU={exp.get('gpu') or 'CPU'} | "
+                    f"exit={exp.get('exit_code')} | "
+                    f"{hyp_snippet}"
+                )
 
+            print_panel(
+                "\n".join(summary_lines),
+                "Orchestrator: Experiments So Far",
+                "dim",
+            )
+            log_step("ORCH_SUMMARY", f"{len(all_experiments)} experiments run so far")
+
+    # Safety net: if we exited the loop without an explicit [DONE], ask for the final paper now.
+    print_status(
+        "Orchestrator loop ended without explicit [DONE]. Requesting final paper...",
+        "bold yellow",
+    )
+    history.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(
+                    text=(
+                        "Using everything above (including all transcripts and notes), "
+                        "write the final Arxiv-style paper as specified in the system prompt. "
+                        "When you are finished, end with a line containing only [DONE]."
+                    )
+                )
+            ],
+        )
+    )
+
+    try:
         final_response = client.models.generate_content(
             model="gemini-3-pro-preview",
             contents=history,
-            config=_build_generation_config(
+            config=_build_orchestrator_generation_config(
                 tools=None,
                 system_instruction=system_prompt,
                 disable_autofc=True,
             ),
         )
-
         final_text = final_response.text or ""
-        base_print_panel(final_text, "Orchestrator: Final Paper", "bold green")
-    finally:
-        print_status("[Orchestrator] Program finished.", "bold cyan")
+        print_panel(final_text, "Final Paper", "bold green")
+        log_step("ORCH_FINAL", "Final paper generated.")
+    except Exception as e:
+        print_status(f"Failed to generate final paper: {e}", "error")
+        logger.error(f"Failed to generate final paper: {e}")
