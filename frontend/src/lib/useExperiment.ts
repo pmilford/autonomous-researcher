@@ -84,36 +84,102 @@ export function useExperiment() {
     const appendToLatestAgentStep = (id: string, type: StepType, chunk: string) => {
         setAgents((prev) => {
             const current = prev[id];
-            if (!current || current.steps.length === 0) return prev;
+            if (!current) return prev;
 
             const steps = [...current.steps];
+
+            const newStep: ExperimentStep = {
+                id: Math.random().toString(36).substring(7),
+                type,
+                content: chunk,
+                timestamp: Date.now(),
+            };
+
+            // If there are no steps yet, create the first one so we can stream into it.
+            if (steps.length === 0) {
+                const next = {
+                    ...prev,
+                    [id]: {
+                        ...current,
+                        steps: [newStep],
+                    },
+                };
+                agentsRef.current = next;
+                return next;
+            }
+
             const lastStep = steps[steps.length - 1];
 
             // If the last step matches the type, append to it.
-            // Otherwise, we might need to create a new one, but for 'result' streaming
-            // we generally expect a result block to exist (created by TOOL_CALL or just implicitly).
-            // If it doesn't exist or type doesn't match, we'll create a new one.
             if (lastStep.type === type) {
                 steps[steps.length - 1] = {
                     ...lastStep,
-                    content: lastStep.content + chunk
+                    content: lastStep.content + chunk,
                 };
             } else {
                 // Fallback: create new step if types mismatch
-                steps.push({
-                    id: Math.random().toString(36).substring(7),
-                    type,
-                    content: chunk,
-                    timestamp: Date.now(),
-                });
+                steps.push(newStep);
             }
 
             const next = {
                 ...prev,
-                [id]: { ...current, steps }
+                [id]: { ...current, steps },
             };
             agentsRef.current = next;
             return next;
+        });
+    };
+
+    const appendToLatestOrchestratorStep = (type: "thought" | "text", chunk: string) => {
+        setOrchestrator((prev) => {
+            const timeline = [...prev.timeline];
+            const lastItem = timeline[timeline.length - 1];
+            
+            // Check if we can append to the last item
+            if (lastItem && lastItem.type === type) {
+                timeline[timeline.length - 1] = {
+                    ...lastItem,
+                    content: lastItem.content + chunk
+                };
+                
+                // Also update thoughts array if it's a thought
+                let thoughts = prev.thoughts;
+                if (type === "thought") {
+                    thoughts = [...prev.thoughts];
+                    if (thoughts.length > 0) {
+                        thoughts[thoughts.length - 1] = thoughts[thoughts.length - 1] + chunk;
+                    } else {
+                        thoughts.push(chunk);
+                    }
+                }
+                
+                return { ...prev, timeline, thoughts };
+            } else {
+                // Create new item
+                const newItem: TimelineItem = {
+                    type: type as any, // 'text' isn't in TimelineItem type explicitly? let's check
+                    content: chunk,
+                    timestamp: Date.now()
+                };
+                
+                // TimelineItem is: thought | agents | paper. 
+                // If 'text' is meant to be something else, we might need to adjust.
+                // But 'thought' is definitely supported.
+                if (type !== "thought") {
+                    // For now orchestrator only really supports 'thought' and 'paper' and 'agents' in timeline
+                    // If we have general text messages, maybe treat as thoughts or ignore?
+                    // Orchestrator messages are usually shown as 'info' panels in CLI.
+                    // In frontend timeline, we map 'thought' to the Orchestrator block.
+                    // Let's assume 'thought' for now.
+                    return prev;
+                }
+
+                return {
+                    ...prev,
+                    timeline: [...timeline, newItem],
+                    thoughts: [...prev.thoughts, chunk]
+                };
+            }
         });
     };
 
@@ -240,6 +306,12 @@ export function useExperiment() {
                 }
                 break;
 
+            case "AGENT_THOUGHT_STREAM":
+                if (inferredAgentId && typeof data?.chunk === "string") {
+                    appendToLatestAgentStep(inferredAgentId, "thought", data.chunk);
+                }
+                break;
+
             case "AGENT_TOOL":
                 if (inferredAgentId) {
                     addAgentStep(inferredAgentId, {
@@ -312,6 +384,12 @@ export function useExperiment() {
                         { type: "thought", content: data.thought, timestamp: Date.now() }
                     ]
                 }));
+                break;
+
+            case "ORCH_THOUGHT_STREAM":
+                if (typeof data?.chunk === "string") {
+                    appendToLatestOrchestratorStep("thought", data.chunk);
+                }
                 break;
 
             case "ORCH_PAPER":

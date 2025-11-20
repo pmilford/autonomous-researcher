@@ -343,7 +343,8 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False):
         print_status(f"Step {step}...", "dim")
 
         try:
-            response = client.models.generate_content(
+            # Stream the model's response so we can surface thinking and tool calls in real time.
+            response_stream = client.models.generate_content_stream(
                 model="gemini-3-pro-preview",
                 contents=history,
                 config=_build_generation_config(
@@ -357,16 +358,77 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False):
             logger.error(f"API Error: {e}")
             break
 
-        if not response.candidates:
-            print_status("Empty response from model.", "warning")
-            break
+        # Accumulate full response for history and logic
+        accumulated_parts = []
 
-        candidate = response.candidates[0]
-        model_content = candidate.content
+        # Track chunks
+        for chunk in response_stream:
+             if not chunk.candidates:
+                 continue
+             
+             candidate = chunk.candidates[0]
+             if not candidate.content or not candidate.content.parts:
+                 continue
+             
+             for part in candidate.content.parts:
+                 # 1. Streaming thoughts
+                 if getattr(part, "thought", False) and part.text:
+                     emit_event("AGENT_THOUGHT_STREAM", {"chunk": part.text})
+                 
+                 # Add to accumulator
+                 accumulated_parts.append(part)
 
-        if not model_content or not model_content.parts:
+        # Reconstruct the full Content object (merge logic similar to orchestrator)
+        merged_parts = []
+        current_text_part = None
+        current_thought_part = None
+        
+        for part in accumulated_parts:
+            # Handle Function Calls
+            if part.function_call:
+                if current_text_part:
+                    merged_parts.append(current_text_part)
+                    current_text_part = None
+                if current_thought_part:
+                    merged_parts.append(current_thought_part)
+                    current_thought_part = None
+                merged_parts.append(part)
+                continue
+                
+            # Handle Thoughts
+            if getattr(part, "thought", False):
+                if current_text_part:
+                    merged_parts.append(current_text_part)
+                    current_text_part = None
+                
+                if current_thought_part:
+                    current_thought_part.text += part.text
+                else:
+                    current_thought_part = part
+                continue
+
+            # Handle Text
+            if part.text:
+                if current_thought_part:
+                    merged_parts.append(current_thought_part)
+                    current_thought_part = None
+                    
+                if current_text_part:
+                    current_text_part.text += part.text
+                else:
+                    current_text_part = part
+                continue
+        
+        if current_text_part:
+            merged_parts.append(current_text_part)
+        if current_thought_part:
+            merged_parts.append(current_thought_part)
+
+        if not merged_parts:
             print_status("Empty content from model.", "warning")
             break
+            
+        model_content = types.Content(role="model", parts=merged_parts)
 
         # IMPORTANT: append the full model message (including thought signatures
         # and function call parts) so the SDK can preserve reasoning state.
@@ -474,7 +536,7 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False):
             )
         )
 
-        final_response = client.models.generate_content(
+        final_response_stream = client.models.generate_content_stream(
             model="gemini-3-pro-preview",
             contents=history,
             # Still use thinking so the model can reason about its own trace,
@@ -486,7 +548,20 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False):
             ),
         )
 
-        final_text = final_response.text or ""
+        final_parts = []
+        for chunk in final_response_stream:
+            if chunk.candidates and chunk.candidates[0].content:
+                for part in chunk.candidates[0].content.parts:
+                    if getattr(part, "thought", False) and part.text:
+                        emit_event("AGENT_THOUGHT_STREAM", {"chunk": part.text})
+                    final_parts.append(part)
+
+        # Basic merge for final text extraction
+        final_text = ""
+        for part in final_parts:
+            if part.text and not getattr(part, "thought", False):
+                final_text += part.text
+        
         print_panel(final_text, "Final Report", "bold green")
     finally:
         _close_shared_sandbox()
