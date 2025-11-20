@@ -17,6 +17,18 @@ _shared_gpu: Optional[str] = None  # Track which GPU the sandbox was created wit
 _selected_gpu: Optional[str] = None  # User-selected GPU for this run
 
 
+def emit_event(event_type: str, data: dict) -> None:
+    """Emit a structured event for the frontend."""
+    import json
+    payload = {
+        "type": event_type,
+        "timestamp": 0,
+        "data": data,
+    }
+    print(f"::EVENT::{json.dumps(payload)}")
+    sys.stdout.flush()
+
+
 def _build_generation_config(
     *,
     tools: Optional[list] = None,
@@ -290,6 +302,7 @@ def run_experiment_loop(hypothesis: str):
             joined_thoughts = "\n\n".join(thoughts)
             print_panel(joined_thoughts, "Agent Thinking", "thought")
             log_step("THOUGHT", joined_thoughts)
+            emit_event("AGENT_THOUGHT", {"thought": joined_thoughts})
 
         # 2. Show natural-language messages (plans, explanations, etc.).
         if messages:
@@ -316,6 +329,7 @@ def run_experiment_loop(hypothesis: str):
 
             print_panel(f"{fn_name}({fn_args})", "Tool Call", "code")
             log_step("TOOL_CALL", f"{fn_name}({fn_args})")
+            emit_event("AGENT_TOOL", {"tool": fn_name, "args": fn_args})
 
             if fn_name == "execute_in_sandbox":
                 result = execute_in_sandbox(**fn_args)

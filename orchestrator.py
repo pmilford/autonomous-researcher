@@ -17,6 +17,18 @@ _default_gpu: Optional[str] = None
 _experiment_counter: int = 0
 
 
+def emit_event(event_type: str, data: Dict[str, Any]) -> None:
+    """Emit a structured event for the frontend."""
+    payload = {
+        "type": event_type,
+        "timestamp": 0,  # Frontend will timestamp
+        "data": data,
+    }
+    # Use a special prefix that the frontend parser will look for
+    print(f"::EVENT::{json.dumps(payload)}")
+    sys.stdout.flush()
+
+
 def _build_orchestrator_generation_config(
     *,
     tools: Optional[List] = None,
@@ -212,6 +224,13 @@ def run_researcher(hypothesis: str, gpu: Optional[str] = None) -> Dict[str, Any]
         "ORCH_EXPERIMENT",
         f"Scheduled experiment {experiment_id} with GPU={assigned_gpu or 'None'}",
     )
+    
+    emit_event("AGENT_START", {
+        "agent_id": str(experiment_id),
+        "hypothesis": hypothesis,
+        "gpu": assigned_gpu,
+        "status": "starting"
+    })
 
     # Build the command for the single-agent process.
     main_path = os.path.join(os.path.dirname(__file__), "main.py")
@@ -244,10 +263,12 @@ def run_researcher(hypothesis: str, gpu: Optional[str] = None) -> Dict[str, Any]
 
     def _reader(stream, chunks: List[str], is_err: bool) -> None:
         """Read from a subprocess stream, streaming to CLI and capturing for transcript."""
+        prefix = f"[Agent {experiment_id}] "
         for line in stream:
             chunks.append(line)
             target = sys.stderr if is_err else sys.stdout
-            target.write(line)
+            # Prefix the output for the frontend parser, but keep the raw line for the transcript
+            target.write(f"{prefix}{line}")
             target.flush()
 
     # Stream stdout and stderr concurrently.
@@ -269,6 +290,11 @@ def run_researcher(hypothesis: str, gpu: Optional[str] = None) -> Dict[str, Any]
         f"[Experiment {experiment_id}] Completed with exit code {exit_code}",
         "bold blue",
     )
+
+    emit_event("AGENT_COMPLETE", {
+        "agent_id": str(experiment_id),
+        "exit_code": exit_code
+    })
 
     transcript = (
         f"=== Experiment {experiment_id} Transcript ===\n"
@@ -429,6 +455,7 @@ def run_orchestrator_loop(
             joined_thoughts = "\n\n".join(thoughts)
             print_panel(joined_thoughts, "Orchestrator Thinking", "thought")
             log_step("ORCH_THOUGHT", joined_thoughts)
+            emit_event("ORCH_THOUGHT", {"thought": joined_thoughts})
 
         # 2. Show natural-language messages (plans, explanations, etc.).
         if messages:
@@ -463,6 +490,7 @@ def run_orchestrator_loop(
                 "code",
             )
             log_step("ORCH_TOOL_CALL", f"{fn_name}({fn_args})")
+            emit_event("ORCH_TOOL", {"tool": fn_name, "args": fn_args})
 
             if fn_name == "run_researcher":
                 return run_researcher(**fn_args)
