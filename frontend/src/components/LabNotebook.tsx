@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Play } from "lucide-react";
+import { Loader2, Play } from "lucide-react";
 import { motion } from "framer-motion";
 import { useExperiment } from "@/lib/useExperiment";
 import { FindingsRail } from "./FindingsRail";
@@ -7,6 +7,20 @@ import { AgentNotebook } from "./Notebook/AgentNotebook";
 import { ResearchPaper } from "./Notebook/ResearchPaper";
 import { cn } from "@/lib/utils";
 import { StreamingMarkdown } from "./StreamingMarkdown";
+import { CredentialPrompt, CredentialFormState } from "./CredentialPrompt";
+import { CredentialStatus, fetchCredentialStatus, saveCredentials } from "@/lib/api";
+
+type PendingRun = {
+  mode: "single" | "orchestrator";
+  config: {
+    task: string;
+    gpu?: string;
+    num_agents?: number;
+    max_rounds?: number;
+    max_parallel?: number;
+    test_mode?: boolean;
+  };
+};
 
 export function LabNotebook() {
   const { isRunning, agents, orchestrator, startExperiment } = useExperiment();
@@ -15,6 +29,27 @@ export function LabNotebook() {
   const [testMode, setTestMode] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevTimelineLengthRef = useRef(0);
+  const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
+  const [credentialForm, setCredentialForm] = useState<CredentialFormState>({
+    googleApiKey: "",
+    modalTokenId: "",
+    modalTokenSecret: "",
+  });
+  const [showCredentialPrompt, setShowCredentialPrompt] = useState(false);
+  const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
+  const [isCheckingCredentials, setIsCheckingCredentials] = useState(false);
+  const [isSavingCredentials, setIsSavingCredentials] = useState(false);
+  const [prereqError, setPrereqError] = useState<string | null>(null);
+  const [credentialPromptError, setCredentialPromptError] = useState<string | null>(null);
+
+  // Check credentials once on load so we can prompt proactively.
+  useEffect(() => {
+    fetchCredentialStatus()
+      .then(setCredentialStatus)
+      .catch(() => {
+        // silently ignore so we don't block the UI if the backend isn't ready yet
+      });
+  }, []);
 
   // Auto-scroll effect
   useEffect(() => {
@@ -41,17 +76,81 @@ export function LabNotebook() {
     prevTimelineLengthRef.current = currentLength;
   }, [orchestrator.timeline]);
 
-  const handleStart = () => {
-    if (!task.trim()) return;
-    startExperiment(mode, {
+  const handleStart = async () => {
+    if (!task.trim() || isCheckingCredentials) return;
+
+    const config = {
       task,
       gpu: "any",
       num_agents: 3,
       max_rounds: 3,
       max_parallel: 2,
       test_mode: testMode,
-    });
+    };
+
+    setPrereqError(null);
+    setCredentialPromptError(null);
+    setIsCheckingCredentials(true);
+
+    try {
+      const status = await fetchCredentialStatus();
+      setCredentialStatus(status);
+
+      const missingKeys = !status.hasGoogleApiKey || !status.hasModalToken;
+      if (missingKeys) {
+        setPendingRun({ mode, config });
+        setShowCredentialPrompt(true);
+        return;
+      }
+
+      startExperiment(mode, config);
+    } catch (err) {
+      setPrereqError(err instanceof Error ? err.message : "Unable to verify API keys.");
+    } finally {
+      setIsCheckingCredentials(false);
+    }
   };
+
+  const handleCredentialFieldChange = (field: keyof CredentialFormState, value: string) => {
+    setCredentialForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleSaveCredentials = async () => {
+    setCredentialPromptError(null);
+    setIsSavingCredentials(true);
+
+    try {
+      const status = await saveCredentials({
+        googleApiKey: credentialForm.googleApiKey || undefined,
+        modalTokenId: credentialForm.modalTokenId || undefined,
+        modalTokenSecret: credentialForm.modalTokenSecret || undefined,
+      });
+      setCredentialStatus(status);
+
+      if (status.hasGoogleApiKey && status.hasModalToken) {
+        setShowCredentialPrompt(false);
+        setCredentialForm({ googleApiKey: "", modalTokenId: "", modalTokenSecret: "" });
+        const nextRun = pendingRun;
+        setPendingRun(null);
+        if (nextRun) {
+          startExperiment(nextRun.mode, nextRun.config);
+        }
+      } else {
+        setCredentialPromptError("We still need both the Google key and Modal token to start a run.");
+      }
+    } catch (err) {
+      setCredentialPromptError(err instanceof Error ? err.message : "Unable to save credentials.");
+    } finally {
+      setIsSavingCredentials(false);
+    }
+  };
+
+  const handleCloseCredentialPrompt = () => {
+    setShowCredentialPrompt(false);
+    setPendingRun(null);
+  };
+
+  const isStartDisabled = !task.trim() || isCheckingCredentials;
 
   return (
     <div className="flex h-screen w-full bg-black font-sans text-[#f5f5f7] selection:bg-[#333] selection:text-white">
@@ -126,19 +225,35 @@ export function LabNotebook() {
                                     </select>
                                 </div>
 
-                                <button
-                                    onClick={handleStart}
-                                    disabled={!task.trim()}
-                                    className={cn(
-                                        "px-8 py-3 rounded-full text-xs font-medium tracking-widest uppercase transition-all duration-500 flex items-center gap-2",
-                                        !task.trim()
-                                            ? "bg-[#1d1d1f] text-[#333] cursor-not-allowed"
-                                            : "bg-white text-black hover:bg-[#e5e5e5] hover:scale-105"
+                                <div className="flex flex-col items-end gap-2">
+                                    <button
+                                        onClick={handleStart}
+                                        disabled={isStartDisabled}
+                                        className={cn(
+                                            "px-8 py-3 rounded-full text-xs font-medium tracking-widest uppercase transition-all duration-500 flex items-center gap-2",
+                                            isStartDisabled
+                                                ? "bg-[#1d1d1f] text-[#333] cursor-not-allowed"
+                                                : "bg-white text-black hover:bg-[#e5e5e5] hover:scale-105"
+                                        )}
+                                    >
+                                        {isCheckingCredentials ? (
+                                            <>
+                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                <span>Checking keys...</span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Play className="w-3 h-3 fill-current" />
+                                                <span>Start Research</span>
+                                            </>
+                                        )}
+                                    </button>
+                                    {prereqError && (
+                                        <p className="text-xs text-red-300 text-right max-w-sm">
+                                            {prereqError}
+                                        </p>
                                     )}
-                                >
-                                    <Play className="w-3 h-3 fill-current" />
-                                    <span>Start Research</span>
-                                </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -258,6 +373,17 @@ export function LabNotebook() {
       {isRunning && (
           <div className="fixed top-0 left-0 right-0 z-50 h-1 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 animate-gradient-x" />
       )}
+
+      <CredentialPrompt
+        open={showCredentialPrompt}
+        status={credentialStatus}
+        form={credentialForm}
+        onChange={handleCredentialFieldChange}
+        onSubmit={handleSaveCredentials}
+        onClose={handleCloseCredentialPrompt}
+        isSaving={isSavingCredentials}
+        error={credentialPromptError}
+      />
     </div>
   );
 }

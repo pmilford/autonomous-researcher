@@ -11,14 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # Load environment variables from the repo's .env file so spawned processes inherit them.
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(ENV_PATH)
 
 MAIN_PATH = BASE_DIR / "main.py"
 
@@ -165,6 +166,33 @@ class AgentSummaryResponse(BaseModel):
     )
 
 
+class CredentialStatus(BaseModel):
+    """Report which required API credentials are present."""
+
+    has_google_api_key: bool = Field(
+        ...,
+        description="True when GOOGLE_API_KEY is set to a non-placeholder value.",
+    )
+    has_modal_token: bool = Field(
+        ...,
+        description="True when both MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are set.",
+    )
+
+
+class CredentialUpdateRequest(BaseModel):
+    """Payload for setting API credentials via the UI."""
+
+    google_api_key: Optional[str] = Field(
+        None, description="Full Google API key from AI Studio"
+    )
+    modal_token_id: Optional[str] = Field(
+        None, description="Modal token ID from https://modal.com/settings/tokens"
+    )
+    modal_token_secret: Optional[str] = Field(
+        None, description="Modal token secret from https://modal.com/settings/tokens"
+    )
+
+
 class ProcessSummary(BaseModel):
     """
     Structured view of a completed CLI run.
@@ -247,6 +275,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _env_value_present(value: Optional[str]) -> bool:
+    """Treat empty or placeholder values as missing."""
+    if value is None:
+        return False
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+
+    lower = cleaned.lower()
+    # Ignore common placeholder patterns (e.g., "your_google_api_key_here").
+    if lower.startswith("your_") or lower.endswith("_here"):
+        return False
+    if lower in {"changeme", "example"}:
+        return False
+    return True
+
+
+def _persist_env(key: str, value: str) -> None:
+    """Persist a credential to both the running process and the .env file."""
+    os.environ[key] = value
+    set_key(str(ENV_PATH), key, value)
+
+
+def _credential_status() -> CredentialStatus:
+    """Summarize which credentials are available."""
+    has_google = _env_value_present(os.environ.get("GOOGLE_API_KEY"))
+    has_modal_id = _env_value_present(os.environ.get("MODAL_TOKEN_ID"))
+    has_modal_secret = _env_value_present(os.environ.get("MODAL_TOKEN_SECRET"))
+    return CredentialStatus(
+        has_google_api_key=has_google,
+        has_modal_token=has_modal_id and has_modal_secret,
+    )
 
 
 def _ensure_main_exists() -> None:
@@ -509,6 +570,45 @@ def get_state() -> Dict[str, Any]:
             "status": "active",
             "info": "Orchestrator module not loaded",
         }
+
+
+@app.get(
+    "/api/credentials/status",
+    response_model=CredentialStatus,
+    summary="Check whether required API keys are set",
+)
+def credentials_status() -> CredentialStatus:
+    """
+    Return a minimal view of credential readiness.
+
+    Used by the frontend to gate runs and prompt users for missing keys.
+    """
+    return _credential_status()
+
+
+@app.post(
+    "/api/credentials",
+    response_model=CredentialStatus,
+    summary="Set Google/Modal credentials (persists to .env)",
+)
+def update_credentials(req: CredentialUpdateRequest) -> CredentialStatus:
+    """
+    Allow the UI to persist credentials locally.
+
+    Keys are written to the running process and the .env file so subsequent
+    subprocesses inherit them.
+    """
+    try:
+        if req.google_api_key and req.google_api_key.strip():
+            _persist_env("GOOGLE_API_KEY", req.google_api_key.strip())
+        if req.modal_token_id and req.modal_token_id.strip():
+            _persist_env("MODAL_TOKEN_ID", req.modal_token_id.strip())
+        if req.modal_token_secret and req.modal_token_secret.strip():
+            _persist_env("MODAL_TOKEN_SECRET", req.modal_token_secret.strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to persist credentials: {e}") from e
+
+    return _credential_status()
 
 
 @app.post(

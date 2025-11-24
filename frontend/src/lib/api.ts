@@ -51,6 +51,17 @@ export interface AgentSummaryResponse {
     chart?: ChartSpec | null;
 }
 
+export interface CredentialStatus {
+    hasGoogleApiKey: boolean;
+    hasModalToken: boolean;
+}
+
+export interface CredentialUpdatePayload {
+    googleApiKey?: string;
+    modalTokenId?: string;
+    modalTokenSecret?: string;
+}
+
 export async function streamExperiment(
     endpoint: "/api/experiments/single/stream" | "/api/experiments/orchestrator/stream",
     payload: ExperimentRequest,
@@ -117,4 +128,40 @@ export async function summarizeAgent(payload: AgentSummaryRequest): Promise<Agen
 
     const data = (await response.json()) as AgentSummaryResponse;
     return data;
+}
+
+export async function fetchCredentialStatus(): Promise<CredentialStatus> {
+    const response = await fetch(`${API_BASE_URL}/api/credentials/status`);
+    if (!response.ok) {
+        throw new Error(`Credential check failed: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return {
+        hasGoogleApiKey: Boolean(data.has_google_api_key),
+        hasModalToken: Boolean(data.has_modal_token),
+    };
+}
+
+export async function saveCredentials(payload: CredentialUpdatePayload): Promise<CredentialStatus> {
+    const response = await fetch(`${API_BASE_URL}/api/credentials`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            google_api_key: payload.googleApiKey,
+            modal_token_id: payload.modalTokenId,
+            modal_token_secret: payload.modalTokenSecret,
+        }),
+    });
+
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Unable to save credentials: ${response.status} ${response.statusText} - ${detail}`);
+    }
+
+    const data = await response.json();
+    return {
+        hasGoogleApiKey: Boolean(data.has_google_api_key),
+        hasModalToken: Boolean(data.has_modal_token),
+    };
 }
