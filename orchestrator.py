@@ -538,6 +538,9 @@ def run_orchestrator_loop(
             try:
                 with open(_run_dir / "final_paper.md", "w", encoding="utf-8") as f:
                     f.write(final_paper)
+                # Also save as writeup.md as requested
+                with open(_run_dir / "writeup.md", "w", encoding="utf-8") as f:
+                    f.write(final_paper)
             except Exception as e:
                 logger.error(f"Failed to save final paper (test mode): {e}")
 
@@ -908,6 +911,9 @@ def _run_claude_orchestrator_loop(
             try:
                 with open(_run_dir / "final_paper.md", "w", encoding="utf-8") as f:
                     f.write(final_paper)
+                # Also save as writeup.md as requested
+                with open(_run_dir / "writeup.md", "w", encoding="utf-8") as f:
+                    f.write(final_paper)
             except Exception as e:
                 logger.error(f"Failed to save final paper: {e}")
 
@@ -1274,6 +1280,9 @@ def _run_gemini_orchestrator_loop(
         if _run_dir:
             try:
                 with open(_run_dir / "final_paper.md", "w", encoding="utf-8") as f:
+                    f.write(final_text)
+                # Also save as writeup.md as requested
+                with open(_run_dir / "writeup.md", "w", encoding="utf-8") as f:
                     f.write(final_text)
             except Exception as e:
                 logger.error(f"Failed to save final paper: {e}")
